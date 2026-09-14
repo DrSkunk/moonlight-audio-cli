@@ -1,0 +1,23 @@
+# macOS Finder metadata
+.DS_Store
+
+# CMake configure and build output
+/build/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Qt generated files and caches
+*.qmlc
+*.jsc
+/.qmake.stash
+/.qt/
+
+# Local development overrides and logs
+.env
+.env.*
+*.log
