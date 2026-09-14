@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QString>
+
 extern "C" {
 #include <Limelight.h>
 }
@@ -19,7 +21,10 @@ public:
     void cleanup();
     void decodeAndQueue(const char* data, int length);
     int configuredLatencyMs() const;
+    int deviceLatencyMs() const;
+    QString statistics() const;
 
 private:
+    void startOutputIfReady(uint32_t availableSamples);
     Impl* m_impl;
 };

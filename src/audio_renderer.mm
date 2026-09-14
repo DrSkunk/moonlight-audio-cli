@@ -1,6 +1,7 @@
 #include "audio_renderer.h"
 
 #include <AudioToolbox/AudioToolbox.h>
+#include <CoreAudio/CoreAudio.h>
 #include <opus/opus_multistream.h>
 
 #include <algorithm>
@@ -17,6 +18,14 @@ struct AudioRenderer::Impl {
     std::atomic<uint32_t> read {0};
     std::atomic<uint32_t> write {0};
     std::atomic<bool> running {false};
+    std::atomic<bool> streamStarted {false};
+    std::atomic<bool> queueStarted {false};
+    std::atomic<uint64_t> decodedPackets {0};
+    std::atomic<uint64_t> queuedSamples {0};
+    std::atomic<uint64_t> droppedSamples {0};
+    std::atomic<uint64_t> underrunSamples {0};
+    std::atomic<uint64_t> outputCallbacks {0};
+    std::atomic<int> deviceLatencyFrames {0};
     uint32_t capacity = 0;
     int sampleRate = 48000;
     int channels = 2;
@@ -36,8 +45,12 @@ void outputCallback(void* context, AudioQueueRef, AudioQueueBufferRef buffer) {
     const uint32_t available = write - read;
     const uint32_t copied = std::min(wanted, available);
     for (uint32_t i = 0; i < copied; ++i) out[i] = impl->ring[(read + i) % impl->capacity];
-    if (copied < wanted) std::memset(out + copied, 0, (wanted - copied) * sizeof(int16_t));
+    if (copied < wanted) {
+        std::memset(out + copied, 0, (wanted - copied) * sizeof(int16_t));
+        impl->underrunSamples.fetch_add(wanted - copied, std::memory_order_relaxed);
+    }
     impl->read.store(read + copied, std::memory_order_release);
+    impl->outputCallbacks.fetch_add(1, std::memory_order_relaxed);
     buffer->mAudioDataByteSize = wanted * sizeof(int16_t);
     AudioQueueEnqueueBuffer(impl->queue, buffer, 0, nullptr);
 }
@@ -103,11 +116,39 @@ int AudioRenderer::initialize(int, const OPUS_MULTISTREAM_CONFIGURATION* config,
         AudioQueueEnqueueBuffer(m_impl->queue, buffer, 0, nullptr);
     }
     m_impl->running.store(true, std::memory_order_release);
-    return AudioQueueStart(m_impl->queue, nullptr) == noErr ? 0 : -1;
+    return 0;
 }
 
-void AudioRenderer::start() {}
-void AudioRenderer::stop() { if (m_impl->queue) AudioQueueStop(m_impl->queue, true); m_impl->running.store(false); }
+void AudioRenderer::startOutputIfReady(uint32_t availableSamples) {
+    const uint32_t minimumSamples = static_cast<uint32_t>(m_impl->sampleRate * m_impl->channels / 50); // 20 ms
+    if (availableSamples < minimumSamples || !m_impl->streamStarted.load(std::memory_order_acquire)) return;
+    bool expected = false;
+    if (!m_impl->queueStarted.compare_exchange_strong(expected, true)) return;
+    if (AudioQueueStart(m_impl->queue, nullptr) != noErr) {
+        m_impl->queueStarted.store(false);
+        return;
+    }
+    AudioDeviceID device = kAudioObjectUnknown;
+    UInt32 size = sizeof(device);
+    if (AudioQueueGetProperty(m_impl->queue, kAudioQueueProperty_CurrentDevice, &device, &size) == noErr && device != kAudioObjectUnknown) {
+        AudioObjectPropertyAddress property { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+        UInt32 frames = 0;
+        size = sizeof(frames);
+        if (AudioObjectGetPropertyData(device, &property, 0, nullptr, &size, &frames) == noErr) m_impl->deviceLatencyFrames.store(frames);
+    }
+}
+
+void AudioRenderer::start() {
+    m_impl->streamStarted.store(true, std::memory_order_release);
+    const uint32_t available = m_impl->write.load(std::memory_order_acquire) - m_impl->read.load(std::memory_order_acquire);
+    startOutputIfReady(available);
+}
+void AudioRenderer::stop() {
+    if (m_impl->queue && m_impl->queueStarted.load()) AudioQueueStop(m_impl->queue, true);
+    m_impl->running.store(false);
+    m_impl->streamStarted.store(false);
+    m_impl->queueStarted.store(false);
+}
 void AudioRenderer::cleanup() {
     stop();
     if (m_impl->queue) { AudioQueueDispose(m_impl->queue, true); m_impl->queue = nullptr; }
@@ -120,11 +161,28 @@ void AudioRenderer::decodeAndQueue(const char* data, int length) {
     const int frames = opus_multistream_decode(m_impl->decoder, reinterpret_cast<const unsigned char*>(data), length, m_impl->decodeBuffer.data(), m_impl->samplesPerFrame, 0);
     if (frames <= 0) return;
     const uint32_t samples = static_cast<uint32_t>(frames * m_impl->channels);
+    m_impl->decodedPackets.fetch_add(1, std::memory_order_relaxed);
     const uint32_t write = m_impl->write.load(std::memory_order_relaxed);
     const uint32_t read = m_impl->read.load(std::memory_order_acquire);
-    if (samples > m_impl->capacity - (write - read)) return;
+    if (samples > m_impl->capacity - (write - read)) {
+        m_impl->droppedSamples.fetch_add(samples, std::memory_order_relaxed);
+        return;
+    }
     for (uint32_t i = 0; i < samples; ++i) m_impl->ring[(write + i) % m_impl->capacity] = m_impl->decodeBuffer[i];
     m_impl->write.store(write + samples, std::memory_order_release);
+    m_impl->queuedSamples.fetch_add(samples, std::memory_order_relaxed);
+    startOutputIfReady(write + samples - read);
 }
 
 int AudioRenderer::configuredLatencyMs() const { return kQueueBuffers * kQueueFrames * 1000 / m_impl->sampleRate; }
+int AudioRenderer::deviceLatencyMs() const { return m_impl->deviceLatencyFrames.load() * 1000 / std::max(1, m_impl->sampleRate); }
+
+QString AudioRenderer::statistics() const {
+    const auto ms = [this](uint64_t samples) { return samples * 1000 / static_cast<uint64_t>(std::max(1, m_impl->sampleRate * m_impl->channels)); };
+    return QString("Audio statistics: %1 Opus packets decoded, %2 ms queued, %3 ms dropped (ring full), %4 ms silence inserted across %5 output callbacks.")
+        .arg(m_impl->decodedPackets.load())
+        .arg(ms(m_impl->queuedSamples.load()))
+        .arg(ms(m_impl->droppedSamples.load()))
+        .arg(ms(m_impl->underrunSamples.load()))
+        .arg(m_impl->outputCallbacks.load());
+}

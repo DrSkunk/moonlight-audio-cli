@@ -7,15 +7,21 @@
 #include <QCommandLineParser>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QRegularExpression>
 #include <QTextStream>
 
 #include <openssl/rand.h>
 
 #include <csignal>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 namespace {
 volatile std::sig_atomic_t interrupted = 0;
+std::atomic<bool> connectionStarted {false};
+std::atomic<bool> connectionTerminated {false};
 void onSignal(int) { interrupted = 1; LiInterruptConnection(); }
 void commonLog(const char*, ...) {}
 
@@ -26,8 +32,8 @@ CONNECTION_LISTENER_CALLBACKS connectionCallbacks() {
     LiInitializeConnectionCallbacks(&callbacks);
     callbacks.stageStarting = [](int stage) { qInfo().noquote() << "Connecting:" << LiGetStageName(stage); };
     callbacks.stageFailed = [](int stage, int error) { qWarning().noquote() << "Connection failed at" << LiGetStageName(stage) << "(" << error << ")"; };
-    callbacks.connectionStarted = [] { qInfo() << "Connected."; };
-    callbacks.connectionTerminated = [](int error) { if (!interrupted) qWarning() << "Connection ended:" << error; };
+    callbacks.connectionStarted = [] { connectionStarted.store(true); qInfo() << "Connected."; };
+    callbacks.connectionTerminated = [](int error) { connectionTerminated.store(true); if (!interrupted) qWarning() << "Connection ended:" << error; };
     callbacks.logMessage = commonLog;
     return callbacks;
 }
@@ -39,7 +45,15 @@ MoonlightApp selectApp(const QVector<MoonlightApp>& apps, const QString& wanted,
     return {};
 }
 
-int stream(const MoonlightHost& host, const MoonlightIdentity& identity, const QString& appName, bool attach, bool verbose, const QString& addressOverride) {
+struct StreamOptions {
+    int width = 320;
+    int height = 180;
+    int fps = 30;
+    int bitrate = 500;
+    int durationSeconds = 0;
+};
+
+int stream(const MoonlightHost& host, const MoonlightIdentity& identity, const QString& appName, bool attach, bool verbose, const QString& addressOverride, const StreamOptions& options) {
     MoonlightClient client(identity, host, verbose, addressOverride);
     ServerInfo server;
     QString error;
@@ -66,10 +80,10 @@ int stream(const MoonlightHost& host, const MoonlightIdentity& identity, const Q
     LiInitializeStreamConfiguration(&config);
     // Sunshine's RTSP parser currently accepts arbitrary positive dimensions;
     // use a small even H.264 stream solely to keep its required video transport alive.
-    config.width = 320;
-    config.height = 180;
-    config.fps = 30;
-    config.bitrate = 500;
+    config.width = options.width;
+    config.height = options.height;
+    config.fps = options.fps;
+    config.bitrate = options.bitrate;
     config.packetSize = 1024;
     config.streamingRemotely = STREAM_CFG_AUTO;
     config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
@@ -101,9 +115,29 @@ int stream(const MoonlightHost& host, const MoonlightIdentity& identity, const Q
     hostInfo.serverCodecModeSupport = server.codecModes;
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
-    qInfo() << "Audio uses an Opus multistream decoder and a 30 ms CoreAudio queue (100 ms bounded PCM ring).";
+    connectionStarted.store(false);
+    connectionTerminated.store(false);
+    qInfo() << "Audio uses an Opus multistream decoder and a" << audio.configuredLatencyMs() << "ms CoreAudio queue (100 ms bounded PCM ring).";
+    if (options.durationSeconds > 0) qInfo() << "Stopping automatically after" << options.durationSeconds << "seconds.";
     qInfo() << "Press Ctrl-C to disconnect.";
+    std::atomic<bool> durationElapsed {false};
+    std::jthread durationStopper;
+    if (options.durationSeconds > 0) {
+        durationStopper = std::jthread([seconds = options.durationSeconds, &durationElapsed](std::stop_token stop) {
+            for (int tenths = seconds * 10; tenths > 0 && !stop.stop_requested(); --tenths) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!stop.stop_requested()) durationElapsed.store(true);
+        });
+    }
     const int result = LiStartConnection(&hostInfo, &config, &callbacks, &videoCallbacks, &audioCallbacks, nullptr, 0, &audio, 0);
+    // moonlight-common-c returns after setup and streams asynchronously. Keep
+    // this process alive, then stop the active connection from this same thread.
+    if (result == 0 && connectionStarted.load()) {
+        while (!interrupted && !durationElapsed.load() && !connectionTerminated.load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        LiStopConnection();
+    }
+    if (durationStopper.joinable()) durationStopper.request_stop();
+    qInfo().noquote() << audio.statistics();
+    qInfo() << "Reported CoreAudio device latency:" << audio.deviceLatencyMs() << "ms.";
     if (result != 0 && !interrupted) { qWarning() << "Failed to establish Moonlight stream:" << result; return 1; }
     return 0;
 }
@@ -117,8 +151,12 @@ int main(int argc, char** argv) {
     parser.addHelpOption(); parser.addVersionOption();
     QCommandLineOption appOption({"a", "app"}, "Sunshine application name (defaults to Desktop).", "name");
     QCommandLineOption attachOption("attach", "Attach to Sunshine's currently active application; ignores --app.");
+    QCommandLineOption videoSizeOption("video-size", "Discarded video stream size, as WIDTHxHEIGHT (default: 320x180).", "size");
+    QCommandLineOption fpsOption("fps", "Discarded video stream frames per second (default: 30).", "fps");
+    QCommandLineOption bitrateOption("bitrate", "Discarded video stream bitrate in Kbps (default: 500).", "kbps");
+    QCommandLineOption durationOption("duration", "Disconnect after this many seconds; useful for diagnostics.", "seconds");
     QCommandLineOption verboseOption("verbose", "Log GameStream API requests.");
-    parser.addOption(appOption); parser.addOption(attachOption); parser.addOption(verboseOption);
+    parser.addOption(appOption); parser.addOption(attachOption); parser.addOption(videoSizeOption); parser.addOption(fpsOption); parser.addOption(bitrateOption); parser.addOption(durationOption); parser.addOption(verboseOption);
     parser.addPositionalArgument("command-or-host", "hosts, apps, or a known Moonlight host name/address.");
     parser.addPositionalArgument("host", "Host for the apps command.");
     parser.process(app);
@@ -154,5 +192,22 @@ int main(int argc, char** argv) {
         for (const auto& item : apps) if (!item.hidden) QTextStream(stdout) << item.name << '\n';
         return 0;
     }
-    return stream(*host, config.identity(), parser.value(appOption), parser.isSet(attachOption), parser.isSet(verboseOption), addressOverride);
+    StreamOptions options;
+    if (parser.isSet(videoSizeOption)) {
+        const QRegularExpressionMatch match = QRegularExpression("^(\\d+)x(\\d+)$").match(parser.value(videoSizeOption));
+        if (!match.hasMatch()) { printError("--video-size must be WIDTHxHEIGHT."); return 2; }
+        options.width = match.captured(1).toInt();
+        options.height = match.captured(2).toInt();
+    }
+    const auto positive = [&parser](const QCommandLineOption& option, int* value) {
+        if (!parser.isSet(option)) return true;
+        bool ok = false;
+        const int parsed = parser.value(option).toInt(&ok);
+        if (!ok || parsed <= 0) { printError("--" + option.names().last() + " must be a positive integer."); return false; }
+        *value = parsed;
+        return true;
+    };
+    if (options.width < 2 || options.height < 2 || options.width % 2 || options.height % 2) { printError("--video-size must contain positive even dimensions."); return 2; }
+    if (!positive(fpsOption, &options.fps) || !positive(bitrateOption, &options.bitrate) || !positive(durationOption, &options.durationSeconds)) return 2;
+    return stream(*host, config.identity(), parser.value(appOption), parser.isSet(attachOption), parser.isSet(verboseOption), addressOverride, options);
 }

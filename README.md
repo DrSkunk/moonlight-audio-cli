@@ -32,11 +32,15 @@ build/moonlight-audio apps Gaming-PC
 build/moonlight-audio Gaming-PC --app Desktop
 build/moonlight-audio 192.168.1.50 --app Steam --verbose
 build/moonlight-audio Gaming-PC --attach
+build/moonlight-audio Gaming-PC --attach --duration 15 --video-size 640x360 --fps 30 --bitrate 1000
 ```
 
 Host names, UUIDs, and each saved local/manual/remote/IPv6 address are matched
 against Moonlight's known-host records. An address which is absent from those
 records is intentionally rejected because it cannot prove an existing pairing.
+For an existing record, the CLI attempts every saved address until mutual TLS
+and the pinned host certificate succeed. Supplying a saved address explicitly
+tries it first.
 `Desktop` is selected when `--app` is omitted, except when Sunshine already has
 an active application: in that case the CLI resumes the active application.
 Use `--attach` to make that choice explicit and ignore `--app`. This is how to
@@ -116,7 +120,7 @@ stereo audio. Current Sunshine source at commit
 parses the requested RTSP width, height, frame rate and bitrate without a
 documented minimum-resolution validation. Therefore 320×180 is an
 implementation choice, not a Sunshine guarantee; hosts/encoders that reject it
-should use a future `--video-size` fallback. H.264 is selected because it is
+can use `--video-size`, `--fps`, and `--bitrate`. H.264 is selected because it is
 the baseline GameStream codec.
 
 Moonlight-common-c still receives the video transport, but its
@@ -128,15 +132,20 @@ The audio callback receives Moonlight-common-c's full
 negotiated sample rate, channel count, streams, coupled-stream count, mapping,
 and samples-per-frame. It writes signed 16-bit PCM into a lock-free SPSC ring;
 the CoreAudio `AudioQueue` callback only copies available samples or writes
-silence. It allocates neither memory nor blocks. The device queue has three
-480-frame buffers: **30 ms at 48 kHz**. The PCM ring is bounded to 100 ms and
-drops new input when full, preventing unbounded latency growth.
+silence. It allocates neither memory nor blocks. CoreAudio starts only after a
+**20 ms** PCM prebuffer. The device queue has three 480-frame buffers:
+**30 ms at 48 kHz**. The PCM ring is bounded to 100 ms and drops new input when
+full, preventing unbounded latency growth.
 
-The 30 ms figure is configured buffering, not an end-to-end latency
-measurement. No Sunshine host is available in this checkout, so a real network
-and host audio latency measurement has not been claimed. The startup log reports
-the configured queue/ring values; measure output latency on the target Mac
-before treating this as production low-latency audio.
+The 20 ms prebuffer and 30 ms queue are configured buffering, not end-to-end
+latency measurements. A ten-second attach test against the paired Sunshine host
+decoded 920 Opus packets, inserted 0 ms of silence, and dropped 30 ms at the
+bounded ring limit. The CoreAudio device latency property reported 0 ms on that
+Mac, so it must not be treated as a physical output-latency measurement. The
+startup log reports configured values and final output reports decoded packets,
+queued/dropped PCM, silence inserted for underruns, output callbacks, and the
+CoreAudio device-reported latency. `--duration SECONDS` provides a bounded
+attach run for gathering those diagnostics.
 
 ## Concurrent use and limitations
 
@@ -151,6 +160,6 @@ two concurrent streams from the same certificate. Test this on the target host
 before relying on simultaneous Moonlight Qt and CLI sessions.
 
 Other current limitations are no pairing UI, no reconnect loop, no host
-discovery, no custom resolution fallback, and no end-to-end host test in this
+discovery, and no end-to-end host test in this
 repository. The `hosts` pairing label means a stored Moonlight pinned-host
 certificate exists; a live pairing check happens for `apps` and streaming.

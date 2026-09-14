@@ -3,6 +3,7 @@
 #include "moonlight_config.h"
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 extern "C" {
@@ -26,10 +27,12 @@ private:
     static QString xmlValue(const QString& xml, const QString& tag);
     static bool responseOk(const QString& xml, QString* error);
     QString chooseAddress() const;
+    QStringList candidateAddresses() const;
 
     MoonlightIdentity m_identity;
     MoonlightHost m_host;
     ServerInfo m_serverInfo;
     bool m_verbose;
     QString m_addressOverride;
+    QString m_activeAddress;
 };

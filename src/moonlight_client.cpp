@@ -48,11 +48,25 @@ MoonlightClient::MoonlightClient(const MoonlightIdentity& identity, const Moonli
     : m_identity(identity), m_host(host), m_verbose(verbose), m_addressOverride(std::move(addressOverride)) {}
 
 QString MoonlightClient::chooseAddress() const {
+    if (!m_activeAddress.isEmpty()) return m_activeAddress;
     if (!m_addressOverride.isEmpty()) return m_addressOverride;
     if (!m_host.localAddress.isEmpty()) return m_host.localAddress;
     if (!m_host.manualAddress.isEmpty()) return m_host.manualAddress;
     if (!m_host.remoteAddress.isEmpty()) return m_host.remoteAddress;
     return m_host.ipv6Address;
+}
+
+QStringList MoonlightClient::candidateAddresses() const {
+    QStringList addresses;
+    const auto add = [&addresses](const QString& address) {
+        if (!address.isEmpty() && !addresses.contains(address, Qt::CaseInsensitive)) addresses.append(address);
+    };
+    if (!m_addressOverride.isEmpty()) add(m_addressOverride);
+    add(m_host.localAddress);
+    add(m_host.manualAddress);
+    add(m_host.remoteAddress);
+    add(m_host.ipv6Address);
+    return addresses;
 }
 
 QString MoonlightClient::activeAddress() const { return chooseAddress(); }
@@ -79,61 +93,71 @@ bool MoonlightClient::responseOk(const QString& xml, QString* error) {
 }
 
 QString MoonlightClient::request(const QString& command, const QString& arguments, int timeoutMs, QString* error) {
-    const QString address = chooseAddress();
-    if (address.isEmpty()) { *error = "The stored Moonlight host record has no usable address."; return {}; }
-    QUrl url;
-    url.setScheme("https");
-    url.setHost(address);
-    url.setPort(m_serverInfo.httpsPort ? m_serverInfo.httpsPort : 47984);
-    url.setPath('/' + command);
-    QUrlQuery query;
-    // Older Moonlight Qt installations may not have initialized the lazily
-    // generated uniqueid setting yet. Pairing itself is certificate-based; use
-    // a deterministic in-memory ID derived from that same certificate without
-    // mutating the user's preferences file.
-    const QString clientId = m_identity.uniqueId.isEmpty()
-        ? QString::fromLatin1(QCryptographicHash::hash(m_identity.certificatePem, QCryptographicHash::Sha256).toHex().left(16))
-        : m_identity.uniqueId;
-    query.addQueryItem("uniqueid", m_host.nvidiaServer ? "0123456789ABCDEF" : clientId);
-    query.addQueryItem("uuid", QUuid::createUuid().toString(QUuid::WithoutBraces));
-    if (!arguments.isEmpty()) {
-        QUrlQuery extra(arguments);
-        for (const auto& item : extra.queryItems(QUrl::FullyDecoded)) query.addQueryItem(item.first, item.second);
-    }
-    url.setQuery(query);
-    if (m_verbose) qInfo().noquote() << "GameStream request:" << url.toDisplayString(QUrl::RemoveQuery);
+    const QStringList addresses = candidateAddresses();
+    if (addresses.isEmpty()) { *error = "The stored Moonlight host record has no usable address."; return {}; }
+    QString lastError;
+    for (const QString& address : addresses) {
+        QUrl url;
+        url.setScheme("https");
+        url.setHost(address);
+        url.setPort(m_serverInfo.httpsPort ? m_serverInfo.httpsPort : 47984);
+        url.setPath('/' + command);
+        QUrlQuery query;
+        // Older Moonlight Qt installations may not have initialized the lazily
+        // generated uniqueid setting yet. Pairing itself is certificate-based; use
+        // a deterministic in-memory ID derived from that same certificate without
+        // mutating the user's preferences file.
+        const QString clientId = m_identity.uniqueId.isEmpty()
+            ? QString::fromLatin1(QCryptographicHash::hash(m_identity.certificatePem, QCryptographicHash::Sha256).toHex().left(16))
+            : m_identity.uniqueId;
+        query.addQueryItem("uniqueid", m_host.nvidiaServer ? "0123456789ABCDEF" : clientId);
+        query.addQueryItem("uuid", QUuid::createUuid().toString(QUuid::WithoutBraces));
+        if (!arguments.isEmpty()) {
+            QUrlQuery extra(arguments);
+            for (const auto& item : extra.queryItems(QUrl::FullyDecoded)) query.addQueryItem(item.first, item.second);
+        }
+        url.setQuery(query);
+        if (m_verbose) qInfo().noquote() << "GameStream request:" << url.toDisplayString(QUrl::RemoveQuery);
 
-    QNetworkAccessManager manager;
-    manager.setProxy(QNetworkProxy::NoProxy);
-    QNetworkRequest request(url);
-    QSslConfiguration ssl = QSslConfiguration::defaultConfiguration();
-    ssl.setLocalCertificate(QSslCertificate(m_identity.certificatePem));
-    // This is the same conversion Moonlight Qt's IdentityManager::getSslKey()
-    // performs under Q_OS_DARWIN for SecureTransport compatibility.
-    ssl.setPrivateKey(QSslKey(traditionalPrivateKey(m_identity.privateKeyPem), QSsl::Rsa));
-    request.setSslConfiguration(ssl);
+        QNetworkAccessManager manager;
+        manager.setProxy(QNetworkProxy::NoProxy);
+        QNetworkRequest request(url);
+        QSslConfiguration ssl = QSslConfiguration::defaultConfiguration();
+        ssl.setLocalCertificate(QSslCertificate(m_identity.certificatePem));
+        // This is the same conversion Moonlight Qt's IdentityManager::getSslKey()
+        // performs under Q_OS_DARWIN for SecureTransport compatibility.
+        ssl.setPrivateKey(QSslKey(traditionalPrivateKey(m_identity.privateKeyPem), QSsl::Rsa));
+        request.setSslConfiguration(ssl);
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+        request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
 #endif
-    const QSslCertificate pinned(m_host.serverCertificatePem);
-    QObject::connect(&manager, &QNetworkAccessManager::sslErrors, &manager, [&pinned](QNetworkReply* reply, const QList<QSslError>& errors) {
-        bool onlyPinned = !pinned.isNull();
-        for (const QSslError& error : errors) onlyPinned = onlyPinned && error.certificate() == pinned;
-        if (onlyPinned) reply->ignoreSslErrors(errors); // exact behavior used by Moonlight Qt NvHTTP
-    });
-    QNetworkReply* reply = manager.get(request);
-    QEventLoop loop;
-    QTimer timer;
-    timer.setSingleShot(true);
-    QObject::connect(&timer, &QTimer::timeout, reply, &QNetworkReply::abort);
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timer.start(timeoutMs);
-    loop.exec();
-    if (reply->error() != QNetworkReply::NoError) { *error = reply->errorString(); reply->deleteLater(); return {}; }
-    const QString body = QString::fromUtf8(reply->readAll());
-    reply->deleteLater();
-    if (m_verbose) qInfo().noquote() << "GameStream response:" << body;
-    return body;
+        const QSslCertificate pinned(m_host.serverCertificatePem);
+        QObject::connect(&manager, &QNetworkAccessManager::sslErrors, &manager, [&pinned](QNetworkReply* reply, const QList<QSslError>& errors) {
+            bool onlyPinned = !pinned.isNull();
+            for (const QSslError& error : errors) onlyPinned = onlyPinned && error.certificate() == pinned;
+            if (onlyPinned) reply->ignoreSslErrors(errors); // exact behavior used by Moonlight Qt NvHTTP
+        });
+        QNetworkReply* reply = manager.get(request);
+        QEventLoop loop;
+        QTimer timer;
+        timer.setSingleShot(true);
+        QObject::connect(&timer, &QTimer::timeout, reply, &QNetworkReply::abort);
+        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        timer.start(timeoutMs);
+        loop.exec();
+        if (reply->error() != QNetworkReply::NoError) {
+            lastError = QString("%1: %2").arg(address, reply->errorString());
+            reply->deleteLater();
+            continue;
+        }
+        const QString body = QString::fromUtf8(reply->readAll());
+        reply->deleteLater();
+        m_activeAddress = address;
+        if (m_verbose) qInfo().noquote() << "GameStream response:" << body;
+        return body;
+    }
+    *error = QString("Unable to reach the paired host at any saved address (%1).").arg(lastError);
+    return {};
 }
 
 bool MoonlightClient::verifyPaired(ServerInfo* info, QString* error) {
