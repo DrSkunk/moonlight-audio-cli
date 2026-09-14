@@ -24,6 +24,13 @@ The first CMake configure downloads the pinned
 For an offline build, populate its source first and point CMake's FetchContent
 source directory at it.
 
+## Nightly releases
+
+Every successful commit pushed to `main` produces an Apple Silicon release
+asset at the GitHub prerelease tagged `nightly`. The tag and release asset are
+replaced on the next successful `main` build. Each release contains
+`moonlight-audio-macos-arm64.tar.gz` and a matching SHA-256 checksum.
+
 ## Run
 
 ```sh

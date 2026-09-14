@@ -45,3 +45,42 @@ jobs:
           path: build/moonlight-audio
           if-no-files-found: error
           retention-days: 14
+
+  publish-nightly:
+    name: Publish nightly release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download Apple Silicon executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: moonlight-audio-macos-arm64
+          path: dist
+
+      - name: Package and publish nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="dist/moonlight-audio-macos-arm64.tar.gz"
+          tar -C dist -czf "$asset" moonlight-audio
+          shasum -a 256 "$asset" > "$asset.sha256"
+
+          git tag -f nightly "$GITHUB_SHA"
+          git push --force origin refs/tags/nightly
+
+          notes="Automated Apple Silicon build for commit $GITHUB_SHA."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "Nightly build" --prerelease --notes "$notes"
+            gh release upload nightly "$asset" "$asset.sha256" --clobber
+          else
+            gh release create nightly "$asset" "$asset.sha256" --title "Nightly build" --prerelease --notes "$notes"
+          fi
