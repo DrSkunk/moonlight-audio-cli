@@ -117,7 +117,7 @@ int stream(const MoonlightHost& host, const MoonlightIdentity& identity, const Q
     std::signal(SIGTERM, onSignal);
     connectionStarted.store(false);
     connectionTerminated.store(false);
-    qInfo() << "Audio uses an Opus multistream decoder and a" << audio.configuredLatencyMs() << "ms CoreAudio queue (100 ms bounded PCM ring).";
+    qInfo() << "Audio uses an Opus multistream decoder on a dedicated decoder thread and a" << audio.configuredLatencyMs() << "ms CoreAudio queue (200 ms bounded PCM jitter buffer).";
     if (options.durationSeconds > 0) qInfo() << "Stopping automatically after" << options.durationSeconds << "seconds.";
     qInfo() << "Press Ctrl-C to disconnect.";
     std::atomic<bool> durationElapsed {false};

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <QString>
 
 extern "C" {
@@ -25,6 +26,6 @@ public:
     QString statistics() const;
 
 private:
-    void startOutputIfReady(uint32_t availableSamples);
+    void startOutputIfReady(uint64_t availableSamples);
     Impl* m_impl;
 };

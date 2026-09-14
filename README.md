@@ -137,12 +137,14 @@ Moonlight-common-c still receives the video transport, but its
 The audio callback receives Moonlight-common-c's full
 `OPUS_MULTISTREAM_CONFIGURATION` and constructs an `OpusMSDecoder` with the
 negotiated sample rate, channel count, streams, coupled-stream count, mapping,
-and samples-per-frame. It writes signed 16-bit PCM into a lock-free SPSC ring;
-the CoreAudio `AudioQueue` callback only copies available samples or writes
-silence. It allocates neither memory nor blocks. CoreAudio starts only after a
-**20 ms** PCM prebuffer. The device queue has three 480-frame buffers:
-**30 ms at 48 kHz**. The PCM ring is bounded to 100 ms and drops new input when
-full, preventing unbounded latency growth.
+and samples-per-frame. It writes signed 16-bit PCM into a lock-free SPSC ring.
+Moonlight-common-c runs that callback on its dedicated audio decoder thread; it
+does not run on the UDP receive thread. The CoreAudio `AudioQueue` callback only
+copies available samples or writes silence. It allocates neither memory nor
+blocks. CoreAudio starts only after a **20 ms** PCM prebuffer. The device queue
+has three 480-frame buffers: **30 ms at 48 kHz**. The PCM jitter ring is capped
+at **200 ms**, which can absorb short Wi-Fi or macOS scheduling gaps while still
+preventing unbounded latency growth.
 
 The 20 ms prebuffer and 30 ms queue are configured buffering, not end-to-end
 latency measurements. A ten-second attach test against the paired Sunshine host
@@ -150,9 +152,35 @@ decoded 920 Opus packets, inserted 0 ms of silence, and dropped 30 ms at the
 bounded ring limit. The CoreAudio device latency property reported 0 ms on that
 Mac, so it must not be treated as a physical output-latency measurement. The
 startup log reports configured values and final output reports decoded packets,
-queued/dropped PCM, silence inserted for underruns, output callbacks, and the
-CoreAudio device-reported latency. `--duration SECONDS` provides a bounded
-attach run for gathering those diagnostics.
+queued/dropped PCM, silence inserted for underruns, output callbacks, peak
+jitter-buffer occupancy, and the CoreAudio device-reported latency.
+`--duration SECONDS` provides a bounded attach run for gathering those
+diagnostics.
+
+## macOS Wi-Fi stutter
+
+This client cannot prevent macOS from taking over the Wi-Fi radio. Moonlight's
+own FAQ says that periodic macOS scans for Location Services and AirDrop delay
+or drop real-time stream traffic. Disable AirDrop and Location Services while
+testing; for the most reliable result, use Ethernet. Moonlight issue
+[#753](https://github.com/moonlight-stream/moonlight-qt/issues/753) contains
+Apple Silicon reports that also implicate the `awdl0` interface used by AirDrop
+and other Continuity services. The CLI intentionally does not disable `awdl0`
+or Bluetooth because that changes system-wide connectivity and requires
+administrator privileges.
+
+As a temporary diagnostic, the affected Moonlight reports use
+`sudo /sbin/ifconfig awdl0 down` before streaming and
+`sudo /sbin/ifconfig awdl0 up` afterwards. This disables AirDrop, Handoff, and
+other Continuity functions that depend on AWDL for that period. It is a manual
+system setting, not a behavior of this CLI.
+
+For a reproducible network check, Sunshine recommends a 60-second reverse UDP
+`iperf3` test from the Mac to the host: `iperf3 -c HOST -t 60 -u -R -b 50M`.
+Packet loss should be below 5% and jitter below 1 ms. If the CLI's final
+statistics report `silence inserted`, the stream arrived too late for playback;
+if they report `dropped (ring full)`, reduce accumulated latency or investigate
+the output device.
 
 ## Concurrent use and limitations
 
