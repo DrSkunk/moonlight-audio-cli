@@ -2,7 +2,7 @@
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
-#include <opus/opus_multistream.h>
+#include <opus_multistream.h>
 
 #include <algorithm>
 #include <atomic>
